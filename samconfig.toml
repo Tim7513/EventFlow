@@ -1,0 +1,46 @@
+# AWS SAM CLI deployment configuration.
+# Run `sam deploy` to use these defaults.
+
+version = 0.1
+
+[default.global.parameters]
+stack_name = "eventflow"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+capabilities       = "CAPABILITY_IAM"
+confirm_changeset  = true
+resolve_s3         = true
+region             = "us-east-1"
+
+[default.deploy.parameters.parameter_overrides]
+Environment = "dev"
+
+# ── Staging ──────────────────────────────────────────────────────────────────
+
+[staging.deploy.parameters]
+stack_name         = "eventflow-staging"
+capabilities       = "CAPABILITY_IAM"
+confirm_changeset  = false
+resolve_s3         = true
+region             = "us-east-1"
+
+[staging.deploy.parameters.parameter_overrides]
+Environment = "staging"
+
+# ── Production ────────────────────────────────────────────────────────────────
+
+[prod.deploy.parameters]
+stack_name         = "eventflow-prod"
+capabilities       = "CAPABILITY_IAM"
+confirm_changeset  = true
+resolve_s3         = true
+region             = "us-east-1"
+
+[prod.deploy.parameters.parameter_overrides]
+Environment        = "prod"
+RateLimitPerSecond = "500"
+RateLimitBurst     = "1000"

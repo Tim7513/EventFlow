@@ -1,0 +1,388 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: EventFlow - Production-style serverless event processing system
+
+# ─────────────────────────────────────────────
+# Global defaults shared across all functions
+# ─────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 30
+    MemorySize: 256
+    Architectures:
+      - arm64
+    Tracing: Active
+    Environment:
+      Variables:
+        EVENTS_TABLE: !Ref EventsTable
+        STATS_TABLE: !Ref StatsTable
+        EVENT_QUEUE_URL: !Ref EventQueue
+        LOG_LEVEL: INFO
+
+# ─────────────────────────────────────────────
+# Parameters
+# ─────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  RateLimitPerSecond:
+    Type: Number
+    Default: 100
+    Description: API Gateway throttle rate limit (requests/second)
+
+  RateLimitBurst:
+    Type: Number
+    Default: 200
+    Description: API Gateway throttle burst limit
+
+# ─────────────────────────────────────────────
+# Resources
+# ─────────────────────────────────────────────
+Resources:
+
+  # ── API Gateway ────────────────────────────
+  EventFlowApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub eventflow-api-${Environment}
+      StageName: !Ref Environment
+      TracingEnabled: true
+      Description: EventFlow REST API
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: !Ref RateLimitPerSecond
+          ThrottlingBurstLimit: !Ref RateLimitBurst
+          LoggingLevel: ERROR
+          DataTraceEnabled: false
+          MetricsEnabled: true
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+        AllowOrigin: "'*'"
+
+  # ── Lambda: POST /event ────────────────────
+  PostEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub eventflow-post-event-${Environment}
+      CodeUri: src/
+      Handler: handlers.post_event.handler
+      Description: Validates incoming events and enqueues them to SQS
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt EventQueue.QueueName
+      Events:
+        PostEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventFlowApi
+            Path: /event
+            Method: POST
+
+  # ── Lambda: GET /stats ─────────────────────
+  GetStatsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub eventflow-get-stats-${Environment}
+      CodeUri: src/
+      Handler: handlers.get_stats.handler
+      Description: Returns aggregated statistics from DynamoDB
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref StatsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref EventsTable
+      Events:
+        GetStats:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventFlowApi
+            Path: /stats
+            Method: GET
+
+  # ── Lambda: GET /events/recent ─────────────
+  GetRecentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub eventflow-get-recent-${Environment}
+      CodeUri: src/
+      Handler: handlers.get_recent.handler
+      Description: Returns recent events with optional type filtering
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref EventsTable
+      Events:
+        GetRecent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EventFlowApi
+            Path: /events/recent
+            Method: GET
+
+  # ── Lambda: SQS Processor ─────────────────
+  SqsProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub eventflow-sqs-processor-${Environment}
+      CodeUri: src/
+      Handler: handlers.sqs_processor.handler
+      Description: Batch-processes events from SQS and writes to DynamoDB
+      Timeout: 60
+      MemorySize: 512
+      # Cap concurrency to protect DynamoDB write capacity
+      ReservedConcurrentExecutions: 10
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref StatsTable
+        - SQSPollerPolicy:
+            QueueName: !GetAtt EventQueue.QueueName
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt EventQueue.Arn
+            # Batch up to 10 messages per Lambda invocation
+            BatchSize: 10
+            # Partial batch failure support — failed messages retry individually
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            # Only invoke once enough messages accumulate or 10s pass
+            MaximumBatchingWindowInSeconds: 10
+
+  # ── DynamoDB: Events ───────────────────────
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub eventflow-events-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: event_id
+          AttributeType: S
+        - AttributeName: event_type
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_id
+          KeyType: HASH
+      # GSI for querying events by type + time range
+      GlobalSecondaryIndexes:
+        - IndexName: type-created_at-index
+          KeySchema:
+            - AttributeName: event_type
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      # TTL to auto-expire old events (set ttl_expiry epoch on each item)
+      TimeToLiveSpecification:
+        AttributeName: ttl_expiry
+        Enabled: true
+
+  # ── DynamoDB: Stats ────────────────────────
+  StatsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub eventflow-stats-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: stat_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: stat_key
+          KeyType: HASH
+
+  # ── SQS: Dead-Letter Queue ─────────────────
+  EventDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub eventflow-dlq-${Environment}
+      # Keep failed messages for 14 days for inspection / replay
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  # ── SQS: Main Event Queue ──────────────────
+  EventQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub eventflow-queue-${Environment}
+      # Must be >= 6× Lambda timeout (60s) → 360s minimum
+      VisibilityTimeout: 360
+      # Keep messages for 1 day if not consumed
+      MessageRetentionPeriod: 86400
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EventDeadLetterQueue.Arn
+        # Move to DLQ after 3 failed attempts
+        maxReceiveCount: 3
+
+  # ── Frontend: S3 Bucket ───────────────────
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub eventflow-frontend-${Environment}-${AWS::AccountId}
+      # No public access — CloudFront uses OAC to reach the bucket privately
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ── Frontend: CloudFront Origin Access Control ──
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub eventflow-oac-${Environment}
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ── Frontend: CloudFront Distribution ─────
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub EventFlow dashboard (${Environment})
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100    # US/Europe edge nodes only
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !GetAtt FrontendOAC.Id
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized (AWS managed)
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+        # SPA support: return index.html for unknown paths so React Router works
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+
+  # ── Frontend: Bucket Policy (allow CloudFront OAC) ──
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}"
+
+  # ── CloudWatch Alarms ──────────────────────
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub eventflow-dlq-not-empty-${Environment}
+      AlarmDescription: Alert when messages land in the DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EventDeadLetterQueue.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# ─────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────
+Outputs:
+  ApiUrl:
+    Description: API Gateway base URL
+    Value: !Sub "https://${EventFlowApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub EventFlow-ApiUrl-${Environment}
+
+  PostEventUrl:
+    Description: POST /event endpoint
+    Value: !Sub "https://${EventFlowApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/event"
+
+  GetStatsUrl:
+    Description: GET /stats endpoint
+    Value: !Sub "https://${EventFlowApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/stats"
+
+  GetRecentUrl:
+    Description: GET /events/recent endpoint
+    Value: !Sub "https://${EventFlowApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/events/recent"
+
+  EventQueueUrl:
+    Description: SQS Event Queue URL
+    Value: !Ref EventQueue
+    Export:
+      Name: !Sub EventFlow-QueueUrl-${Environment}
+
+  EventQueueArn:
+    Description: SQS Event Queue ARN
+    Value: !GetAtt EventQueue.Arn
+
+  DLQUrl:
+    Description: Dead-Letter Queue URL
+    Value: !Ref EventDeadLetterQueue
+
+  EventsTableName:
+    Description: DynamoDB Events table name
+    Value: !Ref EventsTable
+    Export:
+      Name: !Sub EventFlow-EventsTable-${Environment}
+
+  StatsTableName:
+    Description: DynamoDB Stats table name
+    Value: !Ref StatsTable
+    Export:
+      Name: !Sub EventFlow-StatsTable-${Environment}
+
+  FrontendBucketName:
+    Description: S3 bucket for the React dashboard
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub EventFlow-FrontendBucket-${Environment}
+
+  FrontendUrl:
+    Description: CloudFront URL for the dashboard
+    Value: !Sub "https://${FrontendDistribution.DomainName}"
+    Export:
+      Name: !Sub EventFlow-FrontendUrl-${Environment}

@@ -1,0 +1,3 @@
+# boto3 is pre-installed in the Lambda runtime (no need to bundle).
+# Add third-party packages here if needed in the future.
+# e.g.: pydantic==2.7.0
