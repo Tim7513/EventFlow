@@ -58,9 +58,9 @@ Resources:
           HttpMethod: "*"
           ThrottlingRateLimit: !Ref RateLimitPerSecond
           ThrottlingBurstLimit: !Ref RateLimitBurst
-          LoggingLevel: ERROR
+          LoggingLevel: "OFF"
           DataTraceEnabled: false
-          MetricsEnabled: true
+          MetricsEnabled: false
       Cors:
         AllowMethods: "'GET,POST,OPTIONS'"
         AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
@@ -135,8 +135,6 @@ Resources:
       Description: Batch-processes events from SQS and writes to DynamoDB
       Timeout: 60
       MemorySize: 512
-      # Cap concurrency to protect DynamoDB write capacity
-      ReservedConcurrentExecutions: 10
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref EventsTable
